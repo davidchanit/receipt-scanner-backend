@@ -1,6 +1,7 @@
 import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
 import { ImageAnnotatorClient } from '@google-cloud/vision';
 import Tesseract from 'tesseract.js';
+import OpenAI from 'openai';
 
 export interface ExtractedReceiptData {
   date: string;
@@ -18,13 +19,24 @@ export interface ExtractedReceiptData {
 export class AiService {
   private readonly logger = new Logger(AiService.name);
   private visionClient: ImageAnnotatorClient | null = null;
+  private openaiClient: OpenAI | null = null;
 
   constructor() {
-    this.initializeVisionClient();
+    this.initializeClients();
   }
 
-  private async initializeVisionClient(): Promise<void> {
+  private async initializeClients(): Promise<void> {
     try {
+      // Initialize OpenAI client for GPT-4 Vision
+      if (process.env.OPENAI_API_KEY) {
+        this.openaiClient = new OpenAI({
+          apiKey: process.env.OPENAI_API_KEY,
+        });
+        this.logger.log('OpenAI client initialized successfully');
+      } else {
+        this.logger.warn('OpenAI API key not found, GPT-4 Vision will not be available');
+      }
+
       // Check if Google Cloud credentials are available
       if (process.env.GOOGLE_CLOUD_PROJECT_ID && 
           process.env.GOOGLE_CLOUD_PRIVATE_KEY && 
@@ -41,11 +53,10 @@ export class AiService {
         
         this.logger.log('Google Cloud Vision client initialized successfully with secure credentials');
       } else {
-        this.logger.warn('Google Cloud Vision credentials not found, using Tesseract.js OCR fallback');
+        this.logger.warn('Google Cloud Vision credentials not found');
       }
     } catch (error) {
-      this.logger.error('Failed to initialize Google Cloud Vision client', error);
-      this.logger.warn('Falling back to Tesseract.js OCR mode');
+      this.logger.error('Failed to initialize AI clients', error);
     }
   }
 
@@ -53,17 +64,132 @@ export class AiService {
     try {
       this.logger.log('Starting receipt data extraction');
       
-      if (this.visionClient) {
-        this.logger.log('Using Google Cloud Vision API for extraction');
-        return await this.extractWithVisionApi(imageBuffer);
-      } else {
-        this.logger.log('Using Tesseract.js OCR fallback parsing');
-        return await this.fallbackParsing(imageBuffer);
+      // Try GPT-4 Vision first (most intelligent)
+      if (this.openaiClient) {
+        try {
+          this.logger.log('Using GPT-4 Vision for intelligent extraction');
+          return await this.extractWithGpt4Vision(imageBuffer);
+        } catch (error) {
+          this.logger.warn('GPT-4 Vision failed, falling back to Google Vision', error);
+        }
       }
+      
+      // Fallback to Google Cloud Vision
+      if (this.visionClient) {
+        try {
+          this.logger.log('Using Google Cloud Vision API for extraction');
+          return await this.extractWithVisionApi(imageBuffer);
+        } catch (error) {
+          this.logger.warn('Google Cloud Vision failed, falling back to Tesseract', error);
+        }
+      }
+      
+      // Final fallback to Tesseract.js
+      this.logger.log('Using Tesseract.js OCR fallback parsing');
+      return await this.fallbackParsing(imageBuffer);
     } catch (error) {
-      this.logger.error('AI service failed, falling back to Tesseract.js OCR', error);
+      this.logger.error('All AI services failed, using Tesseract.js OCR', error);
       return await this.fallbackParsing(imageBuffer);
     }
+  }
+
+  private async extractWithGpt4Vision(imageBuffer: Buffer): Promise<ExtractedReceiptData> {
+    try {
+      // Convert image to base64
+      const imageBase64 = imageBuffer.toString('base64');
+      
+      const prompt = `Extract the following information from this receipt image and return ONLY a valid JSON object:
+
+{
+  "date": "extracted date in YYYY-MM-DD format",
+  "currency": "3-letter currency code (USD, EUR, CHF, etc.)",
+  "vendor_name": "store/business name",
+  "receipt_items": [
+    {"item_name": "item name", "item_cost": price}
+  ],
+  "tax": tax_amount,
+  "total": total_amount
+}
+
+Important:
+- Return ONLY the JSON, no other text
+- Ensure all numbers are numeric (not strings)
+- If any field cannot be extracted, use reasonable defaults
+- Ensure the JSON is valid and parseable`;
+
+      const response = await this.openaiClient!.chat.completions.create({
+        model: "gpt-4-vision-preview",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: prompt
+              },
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:image/jpeg;base64,${imageBase64}`
+                }
+              }
+            ]
+          }
+        ],
+        max_tokens: 1000,
+      });
+
+      const extractedText = response.choices[0]?.message?.content;
+      if (!extractedText) {
+        throw new Error('No response from GPT-4 Vision');
+      }
+
+      this.logger.debug(`GPT-4 Vision response: ${extractedText.substring(0, 200)}...`);
+
+      // Try to parse the JSON response
+      try {
+        const parsedData = JSON.parse(extractedText);
+        
+        // Validate and transform the data
+        return this.validateAndTransformGptResponse(parsedData);
+      } catch (parseError) {
+        this.logger.error('Failed to parse GPT-4 Vision JSON response', parseError);
+        throw new Error('Invalid response format from GPT-4 Vision');
+      }
+    } catch (error) {
+      this.logger.error('GPT-4 Vision extraction failed', error);
+      throw new InternalServerErrorException('GPT-4 Vision service temporarily unavailable');
+    }
+  }
+
+  private validateAndTransformGptResponse(data: any): ExtractedReceiptData {
+    // Ensure all required fields exist with proper types
+    const validatedData: ExtractedReceiptData = {
+      date: data.date || new Date().toISOString().split('T')[0],
+      currency: data.currency || 'USD',
+      vendor_name: data.vendor_name || 'Unknown Vendor',
+      receipt_items: Array.isArray(data.receipt_items) 
+        ? data.receipt_items.map((item: any) => ({
+            item_name: item.item_name || 'Unknown Item',
+            item_cost: typeof item.item_cost === 'number' ? item.item_cost : 0
+          }))
+        : [{ item_name: 'General Items', item_cost: 0 }],
+      tax: typeof data.tax === 'number' ? data.tax : 0,
+      total: typeof data.total === 'number' ? data.total : 0
+    };
+
+    // Ensure receipt_items is not empty
+    if (validatedData.receipt_items.length === 0) {
+      validatedData.receipt_items = [{ item_name: 'General Items', item_cost: 0 }];
+    }
+
+    // If total is 0 but we have items, calculate it
+    if (validatedData.total === 0 && validatedData.receipt_items.length > 0) {
+      const subtotal = validatedData.receipt_items.reduce((sum, item) => sum + item.item_cost, 0);
+      validatedData.total = subtotal + validatedData.tax;
+    }
+
+    return validatedData;
   }
 
   private async extractWithVisionApi(imageBuffer: Buffer): Promise<ExtractedReceiptData> {
